@@ -12,12 +12,17 @@
     <Description>Auto-download and manage Python environments, pip packages, and virtual environments for C# projects. Supports mirrors, resume, and progress reporting.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>python;venv;pip;environment;interop</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <!-- Exclude samples from compilation -->
   <ItemGroup>
     <Compile Remove="samples\**" />
     <None Remove="samples\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
