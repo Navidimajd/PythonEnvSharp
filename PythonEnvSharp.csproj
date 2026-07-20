@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net6.0;net9.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <PackageId>PythonEnvSharp</PackageId>
+    <Version>1.0.716</Version>
+    <Authors>PythonEnvSharp Contributors</Authors>
+    <Description>Auto-download and manage Python environments, pip packages, and virtual environments for C# projects. Supports mirrors, resume, and progress reporting.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>python;venv;pip;environment;interop</PackageTags>
+  </PropertyGroup>
+
+  <!-- Exclude samples from compilation -->
+  <ItemGroup>
+    <Compile Remove="samples\**" />
+    <None Remove="samples\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.0" />
+  </ItemGroup>
+
+</Project>
