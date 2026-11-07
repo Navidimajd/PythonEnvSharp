@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: Build library
+        run: dotnet build PythonEnvSharp.csproj -c Release
+      - name: Build samples
+        shell: bash
+        run: |
+          for sample in BasicUsage Mirrors NamedPipes SharedEnvironment; do
+            dotnet build "samples/$sample/$sample.csproj" -c Release
+          done
+      - name: Test
+        run: dotnet test tests/PythonEnvSharp.Tests/PythonEnvSharp.Tests.csproj -c Release

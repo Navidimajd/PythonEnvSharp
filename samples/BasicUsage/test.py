@@ -1,8 +1,9 @@
 """Test script for basic usage."""
-import sys
+import contextlib
+import io
 import json
+import sys
 
-sys.stdin.reconfigure(errors='replace')
 print("READY", flush=True)
 
 for line in sys.stdin:
@@ -16,8 +17,11 @@ for line in sys.stdin:
 
         if method == "run":
             code = msg.get("params", {}).get("code", "")
-            exec(code, globals())
-            print(json.dumps({"status": "ok"}), flush=True)
+            # Stdout carries the replies, so capture anything the code prints
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(code, globals())
+            print(json.dumps({"status": "ok", "output": output.getvalue()}), flush=True)
         else:
             print(json.dumps({"status": "error", "message": f"Unknown: {method}"}), flush=True)
     except Exception as e:

@@ -1,8 +1,12 @@
+using Microsoft.Extensions.Logging;
 using PythonEnvSharp;
 
 Console.WriteLine("=== PythonEnvSharp Mirror Fallback Demo ===\n");
 
-// Custom mirrors for faster downloads in China
+using var loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole(o => o.SingleLine = true));
+var logger = loggerFactory.CreateLogger("PythonEnvSharp");
+
+// Tried in order. A blank URL means pip's default index.
 var mirrors = new (string Name, string Url)[]
 {
     ("PyPI (default)", ""),
@@ -11,8 +15,7 @@ var mirrors = new (string Name, string Url)[]
     ("USTC (China)", "https://pypi.mirrors.ustc.edu.cn/simple"),
 };
 
-// Create manager with custom mirrors
-await using var manager = new PythonManager();
+await using var manager = new PythonManager(logger: logger);
 await manager.InitializeAsync();
 
 Console.WriteLine("Installing packages with mirror fallback...\n");

@@ -1,24 +1,31 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net6.0;net9.0</TargetFrameworks>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
 
     <PackageId>PythonEnvSharp</PackageId>
-    <Version>1.0.716</Version>
+    <Version>2.0.0</Version>
     <Authors>PythonEnvSharp Contributors</Authors>
-    <Description>Auto-download and manage Python environments, pip packages, and virtual environments for C# projects. Supports mirrors, resume, and progress reporting.</Description>
+    <Description>Auto-download and manage Python environments, pip packages, and virtual environments for C# projects, on Windows, Linux and macOS. Verifies downloads by SHA-256 and supports mirrors, resume, and progress reporting.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>python;venv;pip;environment;interop</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Navidimajd/PythonEnvSharp</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/Navidimajd/PythonEnvSharp</PackageProjectUrl>
   </PropertyGroup>
 
-  <!-- Exclude samples from compilation -->
+  <!-- Samples and tests are separate projects -->
   <ItemGroup>
-    <Compile Remove="samples\**" />
-    <None Remove="samples\**" />
+    <Compile Remove="samples\**;tests\**" />
+    <None Remove="samples\**;tests\**" />
+    <EmbeddedResource Remove="samples\**;tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PythonEnvSharp.Tests" />
   </ItemGroup>
 
   <ItemGroup>
@@ -26,7 +33,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.3" />
   </ItemGroup>
 
 </Project>

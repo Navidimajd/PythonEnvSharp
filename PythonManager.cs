@@ -1,5 +1,6 @@
-using System.Diagnostics;
-using System.IO.Compression;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -10,37 +11,146 @@ namespace PythonEnvSharp;
 /// </summary>
 public sealed class PythonManager : IAsyncDisposable
 {
+    // Answers "is this requirement satisfied?" with pip's own parsing, so name normalization,
+    // version specifiers and metadata all follow the same rules pip uses.
+    private const string CheckScript = """
+        import importlib.metadata as md, json, sys
+        from pip._vendor.packaging.requirements import Requirement
+        from pip._vendor.packaging.utils import canonicalize_name
+        extra = sys.argv[1]
+        paths = [p for p in sys.path if p] + ([extra] if extra else [])
+        found = {}
+        for d in md.distributions(path=paths):
+            meta = d.metadata
+            name = meta["Name"] if meta else None
+            if name:
+                found.setdefault(canonicalize_name(name), d.version)
+        result = {}
+        for spec in sys.argv[2:]:
+            try:
+                r = Requirement(spec)
+                v = found.get(canonicalize_name(r.name))
+                # Requested extras may need more packages, so those are left for pip to resolve.
+                result[spec] = v is not None and not r.extras and r.url is None and r.specifier.contains(v, prereleases=True)
+            except Exception:
+                result[spec] = False
+        print(json.dumps(result))
+        """;
+
+    // Moves what pip installed into a staging folder over to the shared folder. Only the packages
+    // the caller asked for replace an existing version. Anything else already there is kept, because
+    // other projects may depend on it, and a kept version that differs from pip's choice is reported.
+    // Replacing goes through RECORD, so files the old version had and the new one doesn't are removed.
+    private const string MergeStagedPackagesScript = """
+        import csv, os, re, shutil, sys
+        from pip._vendor.packaging.requirements import Requirement
+
+        staging, target = sys.argv[1], sys.argv[2]
+
+        def canonical(name):
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        requested = set()
+        for spec in sys.argv[3:]:
+            try:
+                requested.add(canonical(Requirement(spec).name))
+            except Exception:
+                pass
+
+        def dists(folder):
+            found = {}
+            for entry in os.listdir(folder):
+                if entry.endswith(".dist-info"):
+                    name, version = entry[:-len(".dist-info")].rsplit("-", 1)
+                    found[canonical(name)] = (entry, version)
+            return found
+
+        def recorded_files(folder, info):
+            record = os.path.join(folder, info, "RECORD")
+            if not os.path.exists(record):
+                return []
+            with open(record, newline="", encoding="utf-8") as f:
+                rows = [row[0] for row in csv.reader(f) if row]
+            files = []
+            for row in rows:
+                parts = os.path.normpath(row).split(os.sep)
+                # pip --target records scripts and data as ../../bin/x, but places them at bin/x.
+                while parts and parts[0] == os.pardir:
+                    parts.pop(0)
+                relative = os.path.join(*parts) if parts else ""
+                if relative and not os.path.isabs(relative) and parts[0] != info:
+                    files.append(relative)
+            return files
+
+        def remove_dist(info):
+            for relative in recorded_files(target, info):
+                path = os.path.join(target, relative)
+                if os.path.isfile(path):
+                    os.remove(path)
+                parent = os.path.dirname(path)
+                while parent != target and os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+                    parent = os.path.dirname(parent)
+            shutil.rmtree(os.path.join(target, info))
+
+        def move_dist(info):
+            for relative in recorded_files(staging, info):
+                source = os.path.join(staging, relative)
+                if os.path.isfile(source):
+                    destination = os.path.join(target, relative)
+                    os.makedirs(os.path.dirname(destination), exist_ok=True)
+                    os.replace(source, destination)
+            destination = os.path.join(target, info)
+            if os.path.exists(destination):
+                shutil.rmtree(destination)
+            shutil.move(os.path.join(staging, info), destination)
+
+        existing = dists(target)
+        for name, (info, version) in dists(staging).items():
+            if name in existing and name not in requested:
+                if existing[name][1] != version:
+                    print(f"Kept {name} {existing[name][1]} because it is already shared; pip chose {version} for this install")
+                continue
+            if name in existing:
+                remove_dist(existing[name][0])
+            move_dist(info)
+        """;
+
+    private const string HealthScript = "import pip, sys, venv; print('%d.%d.%d' % sys.version_info[:3])";
+
     private readonly PythonManagerOptions _options;
     private readonly ILogger _logger;
     private readonly string _sharedPath;
     private readonly string _projectPath;
-    private bool _isInitialized;
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private volatile bool _isInitialized;
+    private bool _disposed;
 
     public string PythonExecutable => GetPythonExecutable();
 
     /// <summary>
     /// Get the shared Python path (used by all projects).
     /// </summary>
-    public string SharedPythonPath => Path.Combine(_sharedPath, "python", "python.exe");
+    public string SharedPythonPath => PythonLayout.SharedPythonExecutable(_sharedPath, _options.PythonVersion);
 
     /// <summary>
     /// Get the shared packages directory.
     /// </summary>
-    public string SharedPackagesPath => Path.Combine(_sharedPath, "packages");
+    public string SharedPackagesPath => PythonLayout.SharedPackagesDir(_sharedPath, _options.PythonVersion);
 
     public PythonManager(PythonManagerOptions? options = null, ILogger? logger = null)
     {
-        _options = options ?? new PythonManagerOptions();
+        _options = options?.Clone() ?? new PythonManagerOptions();
         _logger = logger ?? NullLogger<PythonManager>.Instance;
 
-        _sharedPath = _options.SharedPath
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PythonEnvSharp", "shared");
+        if (!Regex.IsMatch(_options.PythonVersion, @"^\d+\.\d+\.\d+$"))
+            throw new ArgumentException($"PythonVersion must look like 3.11.9, not '{_options.PythonVersion}'.", nameof(options));
 
-        _projectPath = _options.EnvironmentPath
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PythonEnvSharp", "projects", Guid.NewGuid().ToString("N")[..8]);
+        if (_options.InstallMethod == PythonInstallMethod.OfficialInstaller && _options.CustomDistribution is not null)
+            throw new ArgumentException("CustomDistribution can't be combined with the OfficialInstaller install method.", nameof(options));
+
+        _sharedPath = _options.SharedPath ?? PythonLayout.DefaultSharedRoot;
+        _projectPath = _options.EnvironmentPath ?? PythonLayout.ProjectDir(DefaultProjectName());
     }
 
     /// <summary>
@@ -48,16 +158,17 @@ public sealed class PythonManager : IAsyncDisposable
     /// </summary>
     public static PythonManager ForProject(string projectName, PythonManagerOptions? options = null, ILogger? logger = null)
     {
-        options ??= new PythonManagerOptions();
-        options.EnvironmentPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PythonEnvSharp", "projects", projectName);
+        if (!IsValidProjectName(projectName))
+            throw new ArgumentException($"'{projectName}' can't be used as a project name, because it isn't a plain folder name.", nameof(projectName));
 
-        return new PythonManager(options, logger);
+        var copy = options?.Clone() ?? new PythonManagerOptions();
+        copy.EnvironmentPath = PythonLayout.ProjectDir(projectName);
+        return new PythonManager(copy, logger);
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_isInitialized) return;
 
         await _lock.WaitAsync(cancellationToken);
@@ -86,17 +197,54 @@ public sealed class PythonManager : IAsyncDisposable
     private async Task SetupSharedEnvironmentAsync(CancellationToken ct)
     {
         Directory.CreateDirectory(_sharedPath);
+        Directory.CreateDirectory(_projectPath);
 
-        // Download shared Python if not exists
-        var sharedPython = Path.Combine(_sharedPath, "python", "python.exe");
-        if (!File.Exists(sharedPython))
+        using (await FileLock.AcquireAsync(Path.Combine(_sharedPath, ".install.lock"), _logger, ct))
         {
-            Console.WriteLine("  Downloading shared Python...");
-            await DownloadPythonAsync(Path.Combine(_sharedPath, "python"), ct);
+            if (!File.Exists(SharedPythonPath))
+            {
+                var target = PythonLayout.SharedHome(_sharedPath, _options.PythonVersion);
+                await InstallPythonAsync(target, _sharedPath, ct);
+            }
+            else
+            {
+                _logger.LogInformation("Shared Python already installed: {Path}", SharedPythonPath);
+            }
         }
-        else
+
+        var health = await CheckHealthAsync(SharedPythonPath, ct);
+        if (!IsHealthy(health))
+            throw new PythonEnvException($"The shared Python at {SharedPythonPath} is unusable: {health.Problem} Delete its folder to reinstall it.");
+
+        if (_options.AddToUserPath)
         {
-            Console.WriteLine("  Shared Python already installed.");
+            using (await FileLock.AcquireAsync(Path.Combine(_sharedPath, ".install.lock"), _logger, ct))
+            {
+                AddToPath(PythonLayout.SharedHome(_sharedPath, _options.PythonVersion));
+            }
+        }
+    }
+
+    /// <summary>
+    /// A failure here only gets a warning: Python itself works, and some machines forbid this edit by policy.
+    /// </summary>
+    private void AddToPath(string home)
+    {
+        if (!_options.AddToUserPath) return;
+
+        var processPath = UserPathEditor.Prepend(Environment.GetEnvironmentVariable("PATH"), home);
+        if (processPath is not null) Environment.SetEnvironmentVariable("PATH", processPath);
+
+        if (!OperatingSystem.IsWindows()) return;
+
+        try
+        {
+            if (UserPathEditor.AddToRegistry(_options.UserEnvironmentKey, home))
+                _logger.LogInformation("Added {Home} to the user's PATH", home);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException or IOException)
+        {
+            _logger.LogWarning("Couldn't add {Home} to the user's PATH: {Reason}", home, ex.Message);
         }
     }
 
@@ -104,388 +252,282 @@ public sealed class PythonManager : IAsyncDisposable
     {
         Directory.CreateDirectory(_projectPath);
 
-        var venvDir = Path.Combine(_projectPath, "venv");
-        var projectPython = Path.Combine(venvDir, ScriptsDir, "python.exe");
-        if (File.Exists(projectPython)) return;
-
-        var sharedPython = Path.Combine(_sharedPath, "python", "python.exe");
-        if (!File.Exists(sharedPython))
+        using (await FileLock.AcquireAsync(Path.Combine(_projectPath, ".lock"), _logger, ct))
         {
-            throw new PythonEnvException("Shared Python not found. Run InitializeAsync first.");
+            var venvDir = Path.Combine(_projectPath, "venv");
+            var venvPython = PythonLayout.VenvPython(venvDir);
+
+            PythonHealth? health = File.Exists(venvPython) ? await CheckHealthAsync(venvPython, ct) : null;
+            if (health?.Version is not null && !IsHealthy(health))
+            {
+                throw new PythonEnvException(
+                    $"The venv in {venvDir} doesn't match the requested Python: {health.Problem} " +
+                    "Delete the venv or use a different project name.");
+            }
+
+            if (health is null || !IsHealthy(health))
+            {
+                // Without --clear this keeps what's there and only adds what's missing, which
+                // repairs an interrupted creation. It can't fix pip files damaged in other ways.
+                _logger.LogInformation("Creating project environment in {Path}", venvDir);
+                var result = await RunLoggedAsync(SharedPythonPath, new[] { "-m", "venv", venvDir }, ct);
+                if (result.ExitCode != 0)
+                    throw Failure($"Couldn't create a venv in {venvDir}.", result);
+
+                health = await CheckHealthAsync(venvPython, ct);
+                if (!IsHealthy(health))
+                    throw new PythonEnvException($"The venv in {venvDir} is unusable: {health.Problem} Delete the venv folder to recreate it.");
+            }
+
+            await LinkSharedPackagesAsync(venvDir, ct);
         }
+    }
 
-        // Try to create venv
-        Console.WriteLine("  Creating project environment...");
-        var exitCode = await RunCommandWithExitCodeAsync(sharedPython, $"-m venv \"{venvDir}\"", ct);
+    /// <summary>
+    /// Adds the shared packages folder to the venv through a .pth file. It uses site.addsitedir
+    /// rather than a plain path, because only that also processes .pth files inside the folder,
+    /// which packages like pywin32 depend on.
+    /// </summary>
+    private async Task LinkSharedPackagesAsync(string venvDir, CancellationToken ct)
+    {
+        var sitePackages = OperatingSystem.IsWindows()
+            ? Path.Combine(venvDir, "Lib", "site-packages")
+            : Directory.GetDirectories(Path.Combine(venvDir, "lib"), "python*").Select(d => Path.Combine(d, "site-packages")).First();
 
-        if (exitCode != 0 || !File.Exists(projectPython))
+        Directory.CreateDirectory(SharedPackagesPath);
+        var pthFile = Path.Combine(sitePackages, "pythonenvsharp_shared.pth");
+        var content = BuildSharedPackagesPthLine(SharedPackagesPath) + "\n";
+        var existing = File.Exists(pthFile) ? await File.ReadAllTextAsync(pthFile, ct) : null;
+
+        // A venv from 1.x has the plain path. Switching it to addsitedir would start running .pth files
+        // in the shared folder that it has never run, so a working venv keeps what it has.
+        if (existing is null || (existing != content && existing.Trim() != SharedPackagesPath))
         {
-            // Embedded Python doesn't have venv, use shared Python directly
-            Console.WriteLine("  venv not available, using shared Python directly");
-            return;
+            await File.WriteAllTextAsync(pthFile, content, new UTF8Encoding(false), ct);
+            _logger.LogInformation("Configured to use shared packages from {Path}", SharedPackagesPath);
         }
+    }
 
-        // Configure venv to use shared packages
-        var sitePackages = Path.Combine(venvDir, "Lib", "site-packages");
-        if (Directory.Exists(sitePackages))
+    /// <summary>Written as pure ASCII, because Python 3.11 reads .pth files in the locale encoding.</summary>
+    internal static string BuildSharedPackagesPthLine(string packagesDir)
+    {
+        var literal = new StringBuilder();
+        foreach (var rune in packagesDir.EnumerateRunes())
         {
-            // Create .pth file to include shared packages
-            var sharedPackagesDir = Path.Combine(_sharedPath, "packages");
-            Directory.CreateDirectory(sharedPackagesDir);
-            var pthFile = Path.Combine(sitePackages, "pythonenvsharp_shared.pth");
-            await File.WriteAllTextAsync(pthFile, sharedPackagesDir + Environment.NewLine, ct);
-            Console.WriteLine($"  Configured to use shared packages from: {sharedPackagesDir}");
+            if (rune.Value == '\\') literal.Append('/');
+            else if (rune.Value == '"') literal.Append("\\\"");
+            else if (rune.Value is < 0x20 or > 0x7E) literal.Append($"\\U{rune.Value:x8}");
+            else literal.Append((char)rune.Value);
         }
-
-        Console.WriteLine("  Project environment created.");
+        return $"import site; site.addsitedir(\"{literal}\")";
     }
 
     private async Task SetupStandaloneEnvironmentAsync(CancellationToken ct)
     {
         Directory.CreateDirectory(_projectPath);
 
-        var pythonDir = Path.Combine(_projectPath, "python");
-        var pythonExe = Path.Combine(pythonDir, "python.exe");
-
-        if (!File.Exists(pythonExe))
+        using (await FileLock.AcquireAsync(Path.Combine(_projectPath, ".lock"), _logger, ct))
         {
-            await DownloadPythonAsync(pythonDir, ct);
+            var pythonDir = Path.Combine(_projectPath, "python");
+            if (!File.Exists(PythonLayout.PythonExecutableIn(pythonDir)))
+            {
+                await InstallPythonAsync(pythonDir, _projectPath, ct);
+            }
+
+            var health = await CheckHealthAsync(GetPythonExecutable(), ct);
+            if (!IsHealthy(health))
+                throw new PythonEnvException($"The Python in {pythonDir} is unusable: {health.Problem} Delete the folder to reinstall it.");
+
+            AddToPath(pythonDir);
         }
     }
 
+    private async Task InstallPythonAsync(string target, string workRoot, CancellationToken ct)
+    {
+        var version = _options.PythonVersion;
+        var method = _options.InstallMethod;
+
+        if (method == PythonInstallMethod.OfficialInstaller
+            || (method == PythonInstallMethod.Auto && _options.CustomDistribution is null && !PythonCatalog.IsAvailable(version) && OperatingSystem.IsWindows()))
+        {
+            if (!OperatingSystem.IsWindows())
+                throw new PythonEnvException("The python.org installer only runs on Windows.");
+
+            await OfficialPythonInstaller.InstallAsync(version, target, workRoot, _options.DownloadTimeout, _options.DownloadStallTimeout, _options.DownloadProgress, _logger, ct);
+            return;
+        }
+
+        var distribution = _options.CustomDistribution ?? PythonCatalog.Resolve(version);
+        await PythonInstaller.InstallAsync(distribution, target, workRoot, _options.DownloadTimeout, _options.DownloadStallTimeout, _options.DownloadProgress, _logger, ct);
+    }
+
+    /// <param name="Version">The version it reports, or null if it can't run or lacks pip.</param>
+    /// <param name="Problem">What's wrong, if it isn't healthy.</param>
+    private sealed record PythonHealth(string? Version, string? Problem);
+
+    private bool IsHealthy(PythonHealth health) => health.Version == _options.PythonVersion;
+
+    private async Task<PythonHealth> CheckHealthAsync(string python, CancellationToken ct)
+    {
+        var result = await ProcessRunner.RunAsync(python, new[] { "-c", HealthScript }, _projectPath, ct);
+        if (result.ExitCode != 0)
+            return new PythonHealth(null, $"it failed its health check. {Tail(result.StandardError)}");
+
+        var version = result.StandardOutput.Trim();
+        return new PythonHealth(version, version == _options.PythonVersion
+            ? null
+            : $"it has version {version}, but {_options.PythonVersion} was requested.");
+    }
+
+    /// <summary>
+    /// Installs packages, trying each mirror in order. Throws <see cref="PythonEnvException"/> if every mirror fails.
+    /// </summary>
+    /// <param name="packages">Anything pip accepts as a requirement, such as "numpy" or "numpy==1.26.4".</param>
+    /// <param name="mirrors">Package indexes to try. A blank URL means pip's default index.</param>
+    /// <param name="cancellationToken">Stops pip, including any running build.</param>
     public async Task InstallPackagesAsync(
         IEnumerable<string> packages,
         IEnumerable<(string Name, string Url)>? mirrors = null,
         CancellationToken cancellationToken = default)
     {
         var pkgList = packages.ToList();
+        foreach (var package in pkgList) ValidateRequirement(package);
+
         var mirrorList = mirrors?.ToList() ?? GetDefaultMirrors();
-        var pipFlags = "--no-cache-dir --timeout 60 --retries 3";
+        if (mirrorList.Count == 0) mirrorList = GetDefaultMirrors();
+        foreach (var (name, url) in mirrorList) ValidateMirror(name, url);
 
-        if (_options.UseSharedEnvironment)
+        if (pkgList.Count == 0) return;
+        await InitializeAsync(cancellationToken);
+
+        var lockPath = _options.UseSharedEnvironment
+            ? Path.Combine(_sharedPath, ".packages.lock")
+            : Path.Combine(_projectPath, ".lock");
+
+        using (await FileLock.AcquireAsync(lockPath, _logger, cancellationToken))
         {
-            // Install to shared packages directory
-            await InstallToSharedAsync(pkgList, mirrorList, pipFlags, cancellationToken);
-        }
-        else
-        {
-            // Install to project environment
-            var pythonExe = GetPythonExecutable();
-            await InstallToEnvironmentAsync(pythonExe, pkgList, mirrorList, pipFlags, cancellationToken);
+            var state = await CheckRequirementsAsync(pkgList, cancellationToken);
+            var missing = pkgList.Where(p => !state[p]).ToList();
+            if (missing.Count == 0)
+            {
+                _logger.LogInformation("Already installed: {Packages}", string.Join(", ", pkgList));
+                return;
+            }
+
+            _logger.LogInformation("Installing: {Packages}", string.Join(", ", missing));
+            await InstallFromMirrorsAsync(missing, mirrorList, cancellationToken);
         }
     }
 
-    private async Task InstallToSharedAsync(
-        List<string> packages, List<(string Name, string Url)> mirrors, string pipFlags, CancellationToken ct)
+    private async Task InstallFromMirrorsAsync(List<string> packages, List<(string Name, string Url)> mirrors, CancellationToken ct)
     {
-        var sharedPython = Path.Combine(_sharedPath, "python", "python.exe");
-        if (!File.Exists(sharedPython))
+        var python = _options.UseSharedEnvironment ? SharedPythonPath : GetPythonExecutable();
+
+        // Shared installs go to a staging folder first, so a failed install changes nothing.
+        var staging = _options.UseSharedEnvironment ? Path.Combine(_sharedPath, $".staging-{Guid.NewGuid():N}") : null;
+
+        PythonRunResult? last = null;
+        var failedMirrors = new List<string>();
+
+        try
         {
-            throw new PythonEnvException("Shared Python not found. Run InitializeAsync first.");
-        }
-
-        // Check what's already installed
-        Console.WriteLine("  Checking shared packages...");
-        var checkOutput = await RunCommandAsync(sharedPython,
-            $"-m pip show {string.Join(" ", packages)}", ct);
-
-        var installed = packages.Where(p =>
-            checkOutput.Contains($"Name: {p}", StringComparison.OrdinalIgnoreCase)).ToList();
-        var notInstalled = packages.Where(p =>
-            !checkOutput.Contains($"Name: {p}", StringComparison.OrdinalIgnoreCase)).ToList();
-
-        if (installed.Count > 0)
-            Console.WriteLine($"  Already in shared: {string.Join(", ", installed)}");
-
-        if (notInstalled.Count == 0)
-        {
-            Console.WriteLine("  All packages available in shared environment.");
-            return;
-        }
-
-        Console.WriteLine($"  Installing to shared: {string.Join(", ", notInstalled)}");
-
-        // Install with --target to shared packages directory
-        var targetDir = Path.Combine(_sharedPath, "packages");
-        Directory.CreateDirectory(targetDir);
-
-        var cmd = $"-m pip install {string.Join(" ", notInstalled)} {pipFlags} --target \"{targetDir}\"";
-        var exitCode = await RunCommandWithExitCodeAsync(sharedPython, cmd, ct);
-
-        if (exitCode != 0)
-        {
-            // Try mirrors
-            foreach (var (name, url) in mirrors.Skip(1))
+            foreach (var (name, url) in mirrors)
             {
-                var indexArg = $"-i {url} --trusted-host {new Uri(url).Host}";
-                cmd = $"-m pip install {string.Join(" ", notInstalled)} {pipFlags} --target \"{targetDir}\" {indexArg}";
-                Console.WriteLine($"  Retrying from {name}...");
-                exitCode = await RunCommandWithExitCodeAsync(sharedPython, cmd, ct);
-                if (exitCode == 0)
+                var args = new List<string> { "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "60", "--retries", "3" };
+                if (staging is not null) args.AddRange(new[] { "--target", staging });
+                if (!string.IsNullOrEmpty(url)) args.AddRange(new[] { "--index-url", url });
+                args.AddRange(_options.ExtraPipArguments);
+                args.AddRange(packages);
+
+                _logger.LogInformation("Trying package index {Name}", name);
+                last = await RunLoggedAsync(python, args, ct);
+                if (last.ExitCode == 0)
                 {
-                    Console.WriteLine($"  Installed from {name}");
+                    if (staging is not null) await MergeStagedPackagesAsync(python, staging, packages, ct);
+                    _logger.LogInformation("Installed from {Name}", name);
                     return;
                 }
+
+                failedMirrors.Add(name);
+                _logger.LogWarning("Install from {Name} failed with exit code {ExitCode}", name, last.ExitCode);
             }
+
+            throw Failure($"Couldn't install {string.Join(", ", packages)} from any package index ({string.Join(", ", failedMirrors)}).", last!);
+        }
+        finally
+        {
+            if (staging is not null) TryDeleteFolder(staging);
         }
     }
 
-    private async Task InstallToEnvironmentAsync(
-        string pythonExe, List<string> packages, List<(string Name, string Url)> mirrors, string pipFlags, CancellationToken ct)
+    private async Task MergeStagedPackagesAsync(string python, string staging, List<string> requested, CancellationToken ct)
     {
-        Console.WriteLine("  Checking installed packages...");
-        var checkOutput = await RunCommandAsync(pythonExe, $"-m pip show {string.Join(" ", packages)}", ct);
+        Directory.CreateDirectory(SharedPackagesPath);
+        var args = new List<string> { "-c", MergeStagedPackagesScript, staging, SharedPackagesPath };
+        args.AddRange(requested);
 
-        var notInstalled = packages.Where(p =>
-            !checkOutput.Contains($"Name: {p}", StringComparison.OrdinalIgnoreCase)).ToList();
+        var merge = await RunLoggedAsync(python, args, ct);
+        if (merge.ExitCode != 0) throw Failure("Couldn't move installed packages into the shared folder.", merge);
+    }
 
-        if (notInstalled.Count == 0)
+    private void TryDeleteFolder(string folder)
+    {
+        try
         {
-            Console.WriteLine("  All packages installed.");
-            return;
+            if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
         }
-
-        Console.WriteLine($"  Need to install: {string.Join(", ", notInstalled)}");
-
-        var cmd = $"-m pip install {string.Join(" ", notInstalled)} {pipFlags}";
-        var exitCode = await RunCommandWithExitCodeAsync(pythonExe, cmd, ct);
-
-        if (exitCode != 0)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            foreach (var (name, url) in mirrors.Skip(1))
-            {
-                var indexArg = $"-i {url} --trusted-host {new Uri(url).Host}";
-                cmd = $"-m pip install {string.Join(" ", notInstalled)} {pipFlags} {indexArg}";
-                Console.WriteLine($"  Retrying from {name}...");
-                exitCode = await RunCommandWithExitCodeAsync(pythonExe, cmd, ct);
-                if (exitCode == 0)
-                {
-                    Console.WriteLine($"  Installed from {name}");
-                    return;
-                }
-            }
+            _logger.LogWarning("Couldn't remove {Folder}: {Reason}", folder, ex.Message);
         }
     }
 
+    /// <summary>Checks whether a package, or a requirement such as "numpy>=2", is satisfied.</summary>
     public async Task<bool> CheckPackageInstalledAsync(string packageName, CancellationToken cancellationToken = default)
     {
-        // Check in shared packages directory
-        if (_options.UseSharedEnvironment)
-        {
-            var sharedPackagesDir = Path.Combine(_sharedPath, "packages");
-            if (Directory.Exists(sharedPackagesDir))
-            {
-                // Check if package directory exists (case-insensitive)
-                var packageDir = Directory.GetDirectories(sharedPackagesDir)
-                    .FirstOrDefault(d => Path.GetFileName(d).Equals(packageName, StringComparison.OrdinalIgnoreCase));
-                if (packageDir is not null) return true;
-            }
-        }
+        ValidateRequirement(packageName);
+        await InitializeAsync(cancellationToken);
+        var state = await CheckRequirementsAsync(new[] { packageName }, cancellationToken);
+        return state[packageName];
+    }
 
-        // Also check via pip
-        var pythonExe = GetPythonExecutable();
-        var output = await RunCommandAsync(pythonExe, $"-m pip show {packageName}", cancellationToken);
-        return output.Contains($"Name: {packageName}", StringComparison.OrdinalIgnoreCase);
+    private async Task<Dictionary<string, bool>> CheckRequirementsAsync(IReadOnlyCollection<string> requirements, CancellationToken ct)
+    {
+        var args = new List<string> { "-c", CheckScript, _options.UseSharedEnvironment ? SharedPackagesPath : "" };
+        args.AddRange(requirements);
+
+        var result = await ProcessRunner.RunAsync(GetPythonExecutable(), args, _projectPath, ct);
+        if (result.ExitCode != 0) throw Failure("Couldn't check installed packages.", result);
+
+        var lastLine = result.StandardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault();
+        return JsonSerializer.Deserialize<Dictionary<string, bool>>(lastLine ?? "")
+            ?? throw new PythonEnvException("Couldn't read the package check result.");
     }
 
     /// <summary>
-    /// Install pywin32 for named pipe support on Windows.
+    /// Runs Python to completion and returns its exit code and output. A non-zero exit code doesn't throw.
     /// </summary>
-    public async Task EnsureNamedPipeSupportAsync(CancellationToken cancellationToken = default)
+    public async Task<PythonRunResult> RunAsync(IEnumerable<string> arguments, CancellationToken cancellationToken = default)
     {
-        if (!OperatingSystem.IsWindows()) return;
-
-        var installed = await CheckPackageInstalledAsync("pywin32", cancellationToken);
-        if (installed) return;
-
-        Console.WriteLine("  Installing pywin32 for named pipe support...");
-        await InstallPackagesAsync(new[] { "pywin32" }, cancellationToken: cancellationToken);
+        await InitializeAsync(cancellationToken);
+        return await ProcessRunner.RunAsync(GetPythonExecutable(), arguments, _projectPath, cancellationToken);
     }
+
+    /// <summary>
+    /// No longer does anything. Named pipes don't need pywin32: Python can open them with open().
+    /// </summary>
+    [Obsolete("Named pipes don't need pywin32. To use pywin32 itself, install it with InstallPackagesAsync.")]
+    public Task EnsureNamedPipeSupportAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
     public string GetPythonExecutable()
     {
         if (_options.UseSharedEnvironment)
         {
-            var venvPython = Path.Combine(_projectPath, "venv", ScriptsDir, "python.exe");
-            if (File.Exists(venvPython))
-                return venvPython;
-
-            return Path.Combine(_sharedPath, "python", "python.exe");
+            var venvPython = PythonLayout.VenvPython(Path.Combine(_projectPath, "venv"));
+            return File.Exists(venvPython) ? venvPython : SharedPythonPath;
         }
 
-        return Path.Combine(_projectPath, "python", "python.exe");
-    }
-
-    private static string ScriptsDir => OperatingSystem.IsWindows() ? "Scripts" : "bin";
-
-    private async Task<string> DownloadPythonAsync(string targetDir, CancellationToken ct)
-    {
-        // Download full Python installer (includes venv, pip, etc.)
-        var installerName = $"python-{_options.PythonVersion}-amd64.exe";
-
-        var mirrors = new (string Name, string Url)[]
-        {
-            ("npmmirror", $"https://registry.npmmirror.com/-/binary/python/{_options.PythonVersion}/{installerName}"),
-            ("python.org", $"https://www.python.org/ftp/python/{_options.PythonVersion}/{installerName}"),
-        };
-
-        foreach (var (name, url) in mirrors)
-        {
-            try
-            {
-                Console.WriteLine($"  Downloading Python from {name}...");
-
-                using var httpClient = new HttpClient { Timeout = _options.DownloadTimeout };
-                var tempInstaller = Path.Combine(Path.GetTempPath(), $"python-{Guid.NewGuid():N}.exe");
-
-                {
-                    using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-                    response.EnsureSuccessStatusCode();
-                    var total = response.Content.Headers.ContentLength ?? 0;
-                    var downloaded = 0L;
-
-                    await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
-                    await using var fileStream = new FileStream(tempInstaller, FileMode.Create, FileAccess.Write, FileShare.None, 81920);
-                    var buffer = new byte[81920];
-                    int bytesRead;
-
-                    while ((bytesRead = await contentStream.ReadAsync(buffer, ct)) > 0)
-                    {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-                        downloaded += bytesRead;
-                        if (total > 0)
-                            Console.Write($"\r  Downloading: {downloaded / 1024 / 1024}MB / {total / 1024 / 1024}MB ({downloaded * 100 / total}%)");
-                    }
-                    Console.WriteLine();
-                }
-
-                // Install Python silently
-                Console.WriteLine("  Installing Python...");
-                var installDir = Path.Combine(targetDir, "install");
-                Directory.CreateDirectory(installDir);
-
-                var installPsi = new ProcessStartInfo
-                {
-                    FileName = tempInstaller,
-                    Arguments = $"/quiet InstallAllUsers=0 TargetDir=\"{installDir}\" PrependPath=1 Include_test=0 Include_pip=1 Include_launcher=0",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using var installProc = Process.Start(installPsi);
-                if (installProc is not null)
-                {
-                    await installProc.WaitForExitAsync(ct);
-                }
-
-                File.Delete(tempInstaller);
-
-                // Find the installed python.exe
-                var installedPython = Directory.GetFiles(installDir, "python.exe", SearchOption.AllDirectories).FirstOrDefault();
-                if (installedPython is null)
-                {
-                    Console.WriteLine("  Python installation failed, trying embedded fallback...");
-                    return await DownloadEmbeddedPythonAsync(targetDir, ct);
-                }
-
-                // Copy to target directory
-                var installDir2 = Path.GetDirectoryName(installedPython) ?? installDir;
-                CopyDirectory(installDir2, targetDir);
-
-                return targetDir;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  {name} failed: {ex.Message}");
-            }
-        }
-
-        // Fallback to embedded Python
-        Console.WriteLine("  Full installer failed, trying embedded Python...");
-        return await DownloadEmbeddedPythonAsync(targetDir, ct);
-    }
-
-    private async Task<string> DownloadEmbeddedPythonAsync(string targetDir, CancellationToken ct)
-    {
-        var zipName = $"python-{_options.PythonVersion}-embed-amd64.zip";
-
-        var mirrors = new (string Name, string Url)[]
-        {
-            ("npmmirror", $"https://registry.npmmirror.com/-/binary/python/{_options.PythonVersion}/{zipName}"),
-            ("python.org", $"https://www.python.org/ftp/python/{_options.PythonVersion}/{zipName}"),
-        };
-
-        foreach (var (name, url) in mirrors)
-        {
-            try
-            {
-                Console.WriteLine($"  Downloading embedded Python from {name}...");
-
-                using var httpClient = new HttpClient { Timeout = _options.DownloadTimeout };
-                var tempZip = Path.Combine(Path.GetTempPath(), $"python-{Guid.NewGuid():N}.zip");
-
-                {
-                    using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-                    response.EnsureSuccessStatusCode();
-                    var total = response.Content.Headers.ContentLength ?? 0;
-                    var downloaded = 0L;
-
-                    await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
-                    await using var fileStream = new FileStream(tempZip, FileMode.Create, FileAccess.Write, FileShare.None, 81920);
-                    var buffer = new byte[81920];
-                    int bytesRead;
-
-                    while ((bytesRead = await contentStream.ReadAsync(buffer, ct)) > 0)
-                    {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-                        downloaded += bytesRead;
-                        if (total > 0)
-                            Console.Write($"\r  Downloading: {downloaded / 1024 / 1024}MB / {total / 1024 / 1024}MB ({downloaded * 100 / total}%)");
-                    }
-                    Console.WriteLine();
-                }
-
-                ZipFile.ExtractToDirectory(tempZip, targetDir, true);
-                File.Delete(tempZip);
-
-                // Enable pip
-                var pthFile = Directory.GetFiles(targetDir, "python*._pth").FirstOrDefault();
-                if (pthFile is not null)
-                {
-                    var content = await File.ReadAllTextAsync(pthFile, ct);
-                    if (content.Contains("#import"))
-                    {
-                        content = content.Replace("#import", "import");
-                        await File.WriteAllTextAsync(pthFile, content, ct);
-                    }
-                }
-
-                return targetDir;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  {name} failed: {ex.Message}");
-            }
-        }
-
-        throw new PythonEnvException("Failed to download Python from all mirrors");
-    }
-
-    private static void CopyDirectory(string source, string destination)
-    {
-        Directory.CreateDirectory(destination);
-
-        foreach (var file in Directory.GetFiles(source))
-        {
-            var destFile = Path.Combine(destination, Path.GetFileName(file));
-            File.Copy(file, destFile, true);
-        }
-
-        foreach (var dir in Directory.GetDirectories(source))
-        {
-            var destDir = Path.Combine(destination, Path.GetFileName(dir));
-            CopyDirectory(dir, destDir);
-        }
+        return PythonLayout.PythonExecutableIn(Path.Combine(_projectPath, "python"));
     }
 
     private static List<(string Name, string Url)> GetDefaultMirrors() => new()
@@ -496,59 +538,54 @@ public sealed class PythonManager : IAsyncDisposable
         ("USTC", "https://pypi.mirrors.ustc.edu.cn/simple"),
     };
 
-    private async Task<string> RunCommandAsync(string exe, string args, CancellationToken ct)
+    private static string DefaultProjectName()
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = exe, Arguments = args,
-            UseShellExecute = false, RedirectStandardOutput = true,
-            RedirectStandardError = true, CreateNoWindow = true,
-            WorkingDirectory = _projectPath
-        };
-        using var proc = Process.Start(psi) ?? throw new PythonEnvException("Failed to start process");
-        var stdout = await proc.StandardOutput.ReadToEndAsync();
-        await proc.WaitForExitAsync();
-        return stdout;
+        var name = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name;
+        return name is not null && IsValidProjectName(name) ? name : "default";
     }
 
-    private async Task<int> RunCommandWithExitCodeAsync(string exe, string args, CancellationToken ct)
+    private static bool IsValidProjectName(string name) =>
+        !string.IsNullOrWhiteSpace(name)
+        && name is not ("." or "..")
+        && name.IndexOfAny(new[] { '/', '\\', ':', '*', '?', '"', '<', '>', '|' }) < 0
+        && name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+
+    private static void ValidateRequirement(string requirement)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = exe, Arguments = args,
-            UseShellExecute = false, RedirectStandardOutput = true,
-            RedirectStandardError = true, CreateNoWindow = true,
-            WorkingDirectory = _projectPath
-        };
-        using var proc = Process.Start(psi) ?? throw new PythonEnvException("Failed to start process");
-
-        var outputTask = Task.Run(async () =>
-        {
-            while (!proc.StandardOutput.EndOfStream)
-            {
-                var line = await proc.StandardOutput.ReadLineAsync();
-                if (line != null) Console.WriteLine($"    {line}");
-            }
-        }, ct);
-
-        var errorTask = Task.Run(async () =>
-        {
-            while (!proc.StandardError.EndOfStream)
-            {
-                var line = await proc.StandardError.ReadLineAsync();
-                if (line != null && !line.Contains("WARNING") && !line.Contains("DEPRECATION"))
-                    Console.WriteLine($"    {line}");
-            }
-        }, ct);
-
-        await Task.WhenAll(outputTask, errorTask);
-        await proc.WaitForExitAsync(ct);
-        return proc.ExitCode;
+        if (string.IsNullOrWhiteSpace(requirement))
+            throw new ArgumentException("Package names can't be blank.", nameof(requirement));
+        if (requirement.TrimStart().StartsWith('-'))
+            throw new ArgumentException($"'{requirement}' looks like a pip option. Use PythonManagerOptions.ExtraPipArguments for those.", nameof(requirement));
     }
 
-    public async ValueTask DisposeAsync()
+    private static void ValidateMirror(string name, string url)
     {
-        _lock.Dispose();
-        await ValueTask.CompletedTask;
+        if (string.IsNullOrEmpty(url)) return;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+            throw new ArgumentException($"Mirror '{name}' has an invalid URL: '{url}'.", nameof(url));
+    }
+
+    private Task<PythonRunResult> RunLoggedAsync(string exe, IEnumerable<string> args, CancellationToken ct) =>
+        ProcessRunner.RunAsync(exe, args, _projectPath, ct,
+            line => _logger.LogInformation("{Line}", line),
+            line => _logger.LogWarning("{Line}", line));
+
+    private static PythonEnvException Failure(string message, PythonRunResult result) =>
+        new($"{message} Exit code {result.ExitCode}. {Tail(result.StandardError)}", result.ExitCode, result.StandardError);
+
+    private static string Tail(string text)
+    {
+        var trimmed = text.Trim();
+        return trimmed.Length <= 2000 ? trimmed : "..." + trimmed[^2000..];
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (!_disposed)
+        {
+            _disposed = true;
+            _lock.Dispose();
+        }
+        return ValueTask.CompletedTask;
     }
 }

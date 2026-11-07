@@ -3,7 +3,6 @@ import sys
 import json
 import os
 
-sys.stdin.reconfigure(errors='replace')
 print("READY", flush=True)
 
 for line in sys.stdin:
